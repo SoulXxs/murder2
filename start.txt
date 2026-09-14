@@ -9,7 +9,7 @@ local pcScriptString = [[
     loadstring(game:HttpGet("https://raw.githubusercontent.com/SoulXxs/murder2/refs/heads/main/pchub.lua"))()
     
     -- Второй скрипт для ПК
-    loadstring(game:HttpGet(""))()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/SoulXxs/murder2/refs/heads/main/scriptpc.lua"))()
 ]]
 
 local mobileScriptString = [[
@@ -17,7 +17,7 @@ local mobileScriptString = [[
     loadstring(game:HttpGet("https://raw.githubusercontent.com/SoulXxs/murder2/refs/heads/main/phonehub.lua"))()
     
     -- Второй скрипт для телефона
-    loadstring(game:HttpGet(""))()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/SoulXxs/murder2/refs/heads/main/scriptpc.lua"))()
 ]]
 
 local CoreGui = game:GetService("CoreGui")
