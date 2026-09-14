@@ -1,0 +1,256 @@
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+task.wait(0.5)
+
+-- Настройки лоадстрингов (можно менять/добавлять любые loadstring)
+local pcScriptString = [[
+    -- Первый скрипт для ПК
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/SoulXxs/murder2/refs/heads/main/pchub.lua"))()
+    
+    -- Второй скрипт для ПК
+    loadstring(game:HttpGet(""))()
+]]
+
+local mobileScriptString = [[
+    -- Первый скрипт для телефона
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/SoulXxs/murder2/refs/heads/main/phonehub.lua"))()
+    
+    -- Второй скрипт для телефона
+    loadstring(game:HttpGet(""))()
+]]
+
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local guiName = "FantasyPlatformSelector"
+if CoreGui:FindFirstChild(guiName) then
+    CoreGui[guiName]:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = guiName
+ScreenGui.Parent = CoreGui
+ScreenGui.ResetOnSpawn = false
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Parent = ScreenGui
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 32, 38)
+MainFrame.Position = UDim2.new(0.5, -165, 0.5, -115)
+MainFrame.Size = UDim2.new(0, 330, 0, 230)
+
+local UICorner_Main = Instance.new("UICorner")
+UICorner_Main.CornerRadius = UDim.new(0, 14)
+UICorner_Main.Parent = MainFrame
+
+local MainGradient = Instance.new("UIGradient")
+MainGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(50, 54, 62)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(22, 24, 28))
+})
+MainGradient.Rotation = 45
+MainGradient.Parent = MainFrame
+
+local UIStroke = Instance.new("UIStroke")
+UIStroke.Parent = MainFrame
+UIStroke.Color = Color3.fromRGB(155, 168, 185)
+UIStroke.Thickness = 3
+
+local InnerBevel = Instance.new("Frame")
+InnerBevel.Parent = MainFrame
+InnerBevel.Size = UDim2.new(1, -10, 1, -10)
+InnerBevel.Position = UDim2.new(0, 5, 0, 5)
+InnerBevel.BackgroundTransparency = 1
+local InnerStroke = Instance.new("UIStroke")
+InnerStroke.Parent = InnerBevel
+InnerStroke.Color = Color3.fromRGB(12, 13, 16)
+InnerStroke.Thickness = 1.5
+local InnerCorner = Instance.new("UICorner")
+InnerCorner.CornerRadius = UDim.new(0, 10)
+InnerCorner.Parent = InnerBevel
+
+local function createRune(char, pos)
+    local rune = Instance.new("TextLabel")
+    rune.Parent = MainFrame
+    rune.BackgroundTransparency = 1
+    rune.Position = pos
+    rune.Size = UDim2.new(0, 20, 0, 20)
+    rune.Font = Enum.Font.GothamBold
+    rune.Text = char
+    rune.TextColor3 = Color3.fromRGB(200, 225, 255)
+    rune.TextSize = 13
+    rune.ZIndex = 3
+    
+    local glow = Instance.new("UIStroke")
+    glow.Parent = rune
+    glow.Color = Color3.fromRGB(120, 175, 255)
+    glow.Transparency = 0.3
+    glow.Thickness = 1
+end
+
+createRune("❖", UDim2.new(0, 10, 0, 10))
+createRune("❖", UDim2.new(1, -30, 0, 10))
+createRune("❖", UDim2.new(0, 10, 1, -30))
+createRune("❖", UDim2.new(1, -30, 1, -30))
+
+local Title = Instance.new("TextLabel")
+Title.Parent = MainFrame
+Title.BackgroundTransparency = 1
+Title.Position = UDim2.new(0, 0, 0.08, 0)
+Title.Size = UDim2.new(1, 0, 0, 30)
+Title.Font = Enum.Font.GothamBlack
+Title.Text = "SELECT THE PLATFORM"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 16
+Title.ZIndex = 2
+
+local TitleGlow = Instance.new("UIStroke")
+TitleGlow.Parent = Title
+TitleGlow.Color = Color3.fromRGB(90, 140, 220)
+TitleGlow.Thickness = 1.2
+
+local Line = Instance.new("Frame")
+Line.Parent = MainFrame
+Line.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+Line.BorderSizePixel = 0
+Line.Position = UDim2.new(0.1, 0, 0.25, 0)
+Line.Size = UDim2.new(0.8, 0, 0, 2)
+    
+local LineGrad = Instance.new("UIGradient")
+LineGrad.Parent = Line
+LineGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(35, 38, 45)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(180, 215, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(35, 38, 45))
+})
+
+local function createCrystalButton(name, text, yPos, topColor, bottomColor, strokeColor)
+    local Button = Instance.new("TextButton")
+    Button.Name = name
+    Button.Parent = MainFrame
+    Button.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    Button.Position = UDim2.new(0.1, 0, yPos, 0)
+    Button.Size = UDim2.new(0.8, 0, 0, 48)
+    Button.AutoButtonColor = false
+    Button.ClipsDescendants = true
+    Button.Text = ""
+
+    local UICorner = Instance.new("UICorner")
+    UICorner.CornerRadius = UDim.new(0, 9)
+    UICorner.Parent = Button
+
+    local BtnGradient = Instance.new("UIGradient")
+    BtnGradient.Parent = Button
+    BtnGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, topColor),
+        ColorSequenceKeypoint.new(1, bottomColor)
+    })
+    BtnGradient.Rotation = 90
+
+    local BtnStroke = Instance.new("UIStroke")
+    BtnStroke.Parent = Button
+    BtnStroke.Color = strokeColor
+    BtnStroke.Thickness = 2
+
+    local Highlight = Instance.new("Frame")
+    Highlight.Parent = Button
+    Highlight.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    Highlight.BackgroundTransparency = 0.88
+    Highlight.BorderSizePixel = 0
+    Highlight.Size = UDim2.new(1, 0, 0.45, 0)
+    Highlight.ZIndex = 2
+    local HCorner = Instance.new("UICorner")
+    HCorner.CornerRadius = UDim.new(0, 9)
+    HCorner.Parent = Highlight
+
+    local Label = Instance.new("TextLabel")
+    Label.Parent = Button
+    Label.BackgroundTransparency = 1
+    Label.Size = UDim2.new(1, 0, 1, 0)
+    Label.Font = Enum.Font.GothamBold
+    Label.Text = text
+    Label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Label.TextSize = 15
+    Label.ZIndex = 3
+
+    local LabelStroke = Instance.new("UIStroke")
+    LabelStroke.Parent = Label
+    LabelStroke.Color = Color3.fromRGB(5, 10, 20)
+    LabelStroke.Thickness = 1.5
+
+    Button.MouseEnter:Connect(function()
+        TweenService:Create(BtnStroke, TweenInfo.new(0.2), {Thickness = 3, Color = Color3.fromRGB(255, 255, 255)}):Play()
+        TweenService:Create(Highlight, TweenInfo.new(0.2), {BackgroundTransparency = 0.72}):Play()
+    end)
+    Button.MouseLeave:Connect(function()
+        TweenService:Create(BtnStroke, TweenInfo.new(0.2), {Thickness = 2, Color = strokeColor}):Play()
+        TweenService:Create(Highlight, TweenInfo.new(0.2), {BackgroundTransparency = 0.88}):Play()
+    end)
+
+    return Button
+end
+
+local PCButton = createCrystalButton(
+    "PCButton", 
+    "💻 Start on PC", 
+    0.37, 
+    Color3.fromRGB(55, 115, 230),
+    Color3.fromRGB(20, 50, 125),
+    Color3.fromRGB(130, 195, 255)
+)
+
+local MobileButton = createCrystalButton(
+    "MobileButton", 
+    "📱 Start on phone", 
+    0.65, 
+    Color3.fromRGB(45, 175, 95),
+    Color3.fromRGB(15, 75, 40),
+    Color3.fromRGB(130, 255, 175)
+)
+
+local dragging, dragInput, dragStart, startPos
+MainFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+        
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+MainFrame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+local function executeAndSafeExecute(codeString)
+    ScreenGui:Destroy()
+    local success, err = pcall(function()
+        local func = loadstring(codeString)
+        if func then func() end
+    end)
+    if not success then warn(err) end
+end
+
+PCButton.MouseButton1Click:Connect(function()
+    executeAndSafeExecute(pcScriptString)
+end)
+
+MobileButton.MouseButton1Click:Connect(function()
+    executeAndSafeExecute(mobileScriptString)
+end)
