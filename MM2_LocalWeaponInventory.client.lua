@@ -8,7 +8,664 @@
 --//   ReplicatedStorage.Remotes.Inventory.InventoryDataChanged--// MM2 Local Weapon Inventory / Grant Controller
 --// ONE LocalScript
 --// Put in: StarterPlayer > StarterPlayerScripts
+--//--// MM2 Local Weapon Inventory / Grant Controller  (FIXED VISUALS)
+--// ONE LocalScript -> StarterPlayer > StarterPlayerScripts
 --//
+--// ВАЖНО: чтобы в руке и на теле показывалась ИМЕННО выбранная модель,
+--// скопируй Tool-модели оружия из ServerStorage в ReplicatedStorage
+--// (например в папку ReplicatedStorage.WeaponModels). LocalScript не видит
+--// ServerStorage, поэтому без этого есть только запасной вариант (стандартный
+--// нож/пистолет).
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPack = game:GetService("StarterPack")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local Sync = require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"))
+local ProfileData = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("ProfileData"))
+local InventoryRemotes = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Inventory")
+local InventoryDataChanged = InventoryRemotes:FindFirstChild("InventoryDataChanged")
+
+local Weapons = Sync.Weapons or Sync.Item or {}
+
+-- ============================================================
+-- Настройки
+-- ============================================================
+local CONFIG = {
+	-- Показывать оружие на теле, когда оно не в руке
+	ShowHolstered = true,
+
+	-- Смещение оружия на теле (относительно торса). Подгони под свою игру.
+	Holster = {
+		Knife = CFrame.new(0.55, -0.35, 0.62) * CFrame.Angles(0, 0, math.rad(-40)),
+		Gun = CFrame.new(-0.75, -0.9, 0.2) * CFrame.Angles(0, math.rad(90), 0),
+	},
+
+	-- Если игра сама рисует на теле старую модель (дочерний объект персонажа),
+	-- впиши сюда его имя, и оно будет скрыто локально.
+	HideCharacterNames = {},
+}
+
+local ownedLocal = {}     -- [itemId] = true (выданные локально)
+local localEquipped = {}  -- ["Knife"|"Gun"] = itemId
+local active = {}         -- [slot] = { itemId, state, model }
+local hidden = setmetatable({}, { __mode = "k" }) -- [instance] = slot
+
+-- ============================================================
+-- Helpers
+-- ============================================================
+local function getWeaponDisplayName(itemId)
+	local info = Weapons[itemId]
+	if not info then
+		return tostring(itemId)
+	end
+	return info.ItemName or info.Name or info.DisplayName or itemId
+end
+
+local function getWeaponImage(itemId)
+	local info = Weapons[itemId]
+	local image = info and (info.Image or info.Icon)
+	if not image then
+		return ""
+	end
+	if tonumber(image) then
+		return "rbxthumb://type=Asset&w=150&h=150&id=" .. tostring(image)
+	end
+	return tostring(image)
+end
+
+local GUN_WORDS = { "gun", "luger", "blaster", "pistol", "revolver", "rifle", "shotgun" }
+
+local function looksLikeGun(name)
+	name = string.lower(tostring(name))
+	for _, word in ipairs(GUN_WORDS) do
+		if string.find(name, word, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Определяет слот предмета: "Knife" или "Gun"
+local function slotOf(itemId, hint)
+	if hint == "Knife" or hint == "Gun" then
+		return hint
+	end
+	local info = Weapons[itemId]
+	local t = info and (info.ItemType or info.Type or info.Slot)
+	if type(t) == "string" then
+		local l = string.lower(t)
+		if string.find(l, "gun", 1, true) then
+			return "Gun"
+		elseif string.find(l, "knife", 1, true) then
+			return "Knife"
+		end
+	end
+	return looksLikeGun(itemId) and "Gun" or "Knife"
+end
+
+local function slotOfTool(tool)
+	local id = tool:GetAttribute("ItemID") or tool:GetAttribute("OriginalItemID")
+	if type(id) == "string" and Weapons[id] then
+		return slotOf(id)
+	end
+	return looksLikeGun(tool.Name) and "Gun" or "Knife"
+end
+
+local function findRightHand(character)
+	return character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm")
+end
+
+local function findTorso(character)
+	return character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+end
+
+-- ============================================================
+-- Поиск модели оружия, видимой клиенту
+-- ============================================================
+local sourceIndex = nil
+local indexTime = 0
+local sourceCache = {}   -- [itemId] = { source, exact, time }
+local warned = {}
+
+local function buildIndex()
+	sourceIndex = { byName = {}, byId = {} }
+	for _, root in ipairs({ ReplicatedStorage, StarterPack }) do
+		for _, obj in ipairs(root:GetDescendants()) do
+			if (obj:IsA("Tool") or obj:IsA("Model")) and obj:FindFirstChildWhichIsA("BasePart", true) then
+				local key = string.lower(obj.Name)
+				if not sourceIndex.byName[key] then
+					sourceIndex.byName[key] = obj
+				end
+				local attr = obj:GetAttribute("ItemID") or obj:GetAttribute("OriginalItemID")
+				if type(attr) == "string" and not sourceIndex.byId[attr] then
+					sourceIndex.byId[attr] = obj
+				end
+			end
+		end
+	end
+	indexTime = os.clock()
+end
+
+local function findGenericSource(slot)
+	-- 1) Tool, который сейчас реально лежит на персонаже / в рюкзаке
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	for _, root in ipairs({ LocalPlayer.Character, backpack }) do
+		if root then
+			for _, obj in ipairs(root:GetChildren()) do
+				if obj:IsA("Tool") and slotOfTool(obj) == slot then
+					return obj
+				end
+			end
+		end
+	end
+	-- 2) стандартные шаблоны
+	local names = slot == "Gun" and { "gun", "defaultgun" } or { "knife", "defaultknife" }
+	for _, n in ipairs(names) do
+		if sourceIndex and sourceIndex.byName[n] then
+			return sourceIndex.byName[n]
+		end
+	end
+	return nil
+end
+
+-- return source, exact
+local function resolveSource(itemId, slot)
+	local cached = sourceCache[itemId]
+	if cached and cached.source and cached.source.Parent then
+		return cached.source, cached.exact
+	end
+	if cached and not cached.source and os.clock() - cached.time < 5 then
+		return nil, false
+	end
+
+	if not sourceIndex or (os.clock() - indexTime > 5) then
+		buildIndex()
+	end
+
+	local source = sourceIndex.byId[itemId]
+		or sourceIndex.byName[string.lower(itemId)]
+		or sourceIndex.byName[string.lower(getWeaponDisplayName(itemId))]
+
+	if source then
+		sourceCache[itemId] = { source = source, exact = true, time = os.clock() }
+		return source, true
+	end
+
+	if not warned[itemId] then
+		warned[itemId] = true
+		warn("[MM2Local] Нет клиентской модели для '" .. itemId
+			.. "'. Скопируй Tool из ServerStorage в ReplicatedStorage (например WeaponModels).")
+	end
+
+	local generic = findGenericSource(slot)
+	sourceCache[itemId] = { source = generic, exact = false, time = os.clock() }
+	return generic, false
+end
+
+-- ============================================================
+-- Визуал (модель только для отображения, без скриптов)
+-- ============================================================
+local function buildVisual(itemId, slot)
+	local source, exact = resolveSource(itemId, slot)
+	if not source then
+		return nil
+	end
+	-- Чужие (серверные) предметы без точной модели не трогаем:
+	-- пусть игра показывает свою модель.
+	if not exact and not ownedLocal[itemId] then
+		return nil
+	end
+
+	local model = Instance.new("Model")
+	model.Name = "MM2LocalVisual_" .. slot
+	model:SetAttribute("MM2LocalWeapon", true)
+	model:SetAttribute("ItemID", itemId)
+
+	for _, child in ipairs(source:GetChildren()) do
+		child:Clone().Parent = model
+	end
+
+	-- убираем всё, что может выполняться или шуметь
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") or d:IsA("Sound") then
+			d:Destroy()
+		elseif d:IsA("BasePart") then
+			d.Anchored = false
+			d.CanCollide = false
+			d.CanTouch = false
+			d.CanQuery = false
+			d.Massless = true
+		end
+	end
+
+	local handle = model:FindFirstChild("Handle", true)
+	if not (handle and handle:IsA("BasePart")) then
+		handle = model:FindFirstChildWhichIsA("BasePart", true)
+	end
+	if not handle then
+		model:Destroy()
+		return nil
+	end
+
+	local grip = source:IsA("Tool") and source.Grip or CFrame.new()
+	return model, handle, grip
+end
+
+local function attachVisual(character, model, handle, grip, slot, state)
+	local anchorPart, c0, c1
+
+	if state == "hand" then
+		anchorPart = findRightHand(character)
+		if not anchorPart then
+			return false
+		end
+		local att = anchorPart:FindFirstChild("RightGripAttachment")
+		c0 = att and att.CFrame or (CFrame.new(0, -1, 0) * CFrame.Angles(-math.pi / 2, 0, 0))
+		c1 = grip
+	else
+		anchorPart = findTorso(character)
+		if not anchorPart then
+			return false
+		end
+		c0 = CONFIG.Holster[slot] or CFrame.new()
+		c1 = CFrame.new()
+	end
+
+	model.Parent = character
+
+	-- жёстко соединяем остальные части с Handle
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") and p ~= handle then
+			local w = Instance.new("WeldConstraint")
+			w.Part0 = handle
+			w.Part1 = p
+			w.Parent = p
+		end
+	end
+
+	local joint = Instance.new("Weld")
+	joint.Name = "MM2LocalGrip"
+	joint.Part0 = anchorPart
+	joint.Part1 = handle
+	joint.C0 = c0
+	joint.C1 = c1
+	joint.Parent = handle
+	return true
+end
+
+-- ============================================================
+-- Скрытие старой (серверной) модели локально
+-- ============================================================
+local function hideInstance(inst, slot)
+	for _, d in ipairs(inst:GetDescendants()) do
+		if (d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture")) and not hidden[d] then
+			hidden[d] = slot
+			pcall(function()
+				d.LocalTransparencyModifier = 1
+			end)
+		end
+	end
+end
+
+local function restoreHidden(slot)
+	for inst, s in pairs(hidden) do
+		if s == slot then
+			hidden[inst] = nil
+			if inst.Parent then
+				pcall(function()
+					inst.LocalTransparencyModifier = 0
+				end)
+			end
+		end
+	end
+end
+
+local function clearSlot(slot)
+	local a = active[slot]
+	if a and a.model then
+		a.model:Destroy()
+	end
+	active[slot] = nil
+	restoreHidden(slot)
+end
+
+local function findCharacterTool(character, slot)
+	for _, obj in ipairs(character:GetChildren()) do
+		if obj:IsA("Tool") and slotOfTool(obj) == slot then
+			return obj
+		end
+	end
+	return nil
+end
+
+local function updateSlot(character, slot)
+	local itemId = localEquipped[slot]
+	if not itemId then
+		if active[slot] then
+			clearSlot(slot)
+		end
+		return
+	end
+
+	local serverTool = findCharacterTool(character, slot)
+	local state = serverTool and "hand" or "holster"
+
+	if state == "holster" and not CONFIG.ShowHolstered then
+		if active[slot] then
+			clearSlot(slot)
+		end
+		return
+	end
+
+	local a = active[slot]
+	if a and (a.itemId ~= itemId or a.state ~= state or not a.model.Parent) then
+		clearSlot(slot)
+		a = nil
+	end
+
+	if not a then
+		local model, handle, grip = buildVisual(itemId, slot)
+		if not model then
+			return
+		end
+		if not attachVisual(character, model, handle, grip, slot, state) then
+			model:Destroy()
+			return
+		end
+		active[slot] = { itemId = itemId, state = state, model = model }
+	end
+
+	-- прячем старую модель, пока показываем свою
+	if serverTool then
+		hideInstance(serverTool, slot)
+	end
+	for _, name in ipairs(CONFIG.HideCharacterNames) do
+		local extra = character:FindFirstChild(name)
+		if extra then
+			hideInstance(extra, slot)
+		end
+	end
+end
+
+local acc = 0
+RunService.Heartbeat:Connect(function(dt)
+	acc += dt
+	if acc < 0.1 then
+		return
+	end
+	acc = 0
+
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	updateSlot(character, "Knife")
+	updateSlot(character, "Gun")
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+	-- визуалы удаляются вместе со старым персонажем
+	for slot in pairs(active) do
+		active[slot] = nil
+	end
+	table.clear(hidden)
+end)
+
+-- ============================================================
+-- Подключение к штатному инвентарю игры (EquipService)
+-- ============================================================
+local function onEquippedChanged(itemType, itemId)
+	if type(itemId) ~= "string" or not Weapons[itemId] then
+		if itemType == "Knife" or itemType == "Gun" then
+			localEquipped[itemType] = nil
+		end
+		return
+	end
+	localEquipped[slotOf(itemId, itemType)] = itemId
+end
+
+local function connectEquipService()
+	local modulesRoot = ReplicatedStorage:FindFirstChild("Modules")
+	local equipModule = modulesRoot and modulesRoot:FindFirstChild("EquipService", true)
+	if not equipModule or not equipModule:IsA("ModuleScript") then
+		return false
+	end
+
+	local ok, EquipService = pcall(require, equipModule)
+	if not ok or not EquipService or not EquipService.EquippedChanged then
+		warn("[MM2Local] Could not use EquipService:", EquipService)
+		return false
+	end
+
+	local changed = EquipService.EquippedChanged
+	if typeof(changed) == "Instance" and changed:IsA("BindableEvent") then
+		changed.Event:Connect(onEquippedChanged)
+		return true
+	end
+	if type(changed.Connect) == "function" then
+		changed:Connect(onEquippedChanged)
+		return true
+	end
+	return false
+end
+
+if not connectEquipService() then
+	warn("[MM2Local] EquipService hook not found: equipping from the normal inventory won't change visuals.")
+end
+
+-- Уже надетое на момент запуска
+task.defer(function()
+	local ok, equipped = pcall(function()
+		return ProfileData.Weapons and ProfileData.Weapons.Equipped
+	end)
+	if ok and type(equipped) == "table" then
+		for _, key in ipairs({ "Knife", "Gun" }) do
+			local id = equipped[key]
+			if type(id) == "string" and Weapons[id] then
+				localEquipped[slotOf(id, key)] = id
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- Локальная выдача предмета
+-- ============================================================
+local function addLocalItem(itemId)
+	if not Weapons[itemId] then
+		return false
+	end
+	ownedLocal[itemId] = true
+
+	ProfileData.Weapons = ProfileData.Weapons or {}
+	ProfileData.Weapons.Owned = ProfileData.Weapons.Owned or {}
+	ProfileData.Weapons.Owned[itemId] = 1
+
+	if InventoryDataChanged and InventoryDataChanged:IsA("BindableEvent") then
+		InventoryDataChanged:Fire("Weapons", itemId, 1)
+	end
+	return true
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local function make(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local oldGui = PlayerGui:FindFirstChild("MM2LocalWeaponController")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local gui = make("ScreenGui", { Name = "MM2LocalWeaponController", ResetOnSpawn = false }, PlayerGui)
+
+local openButton = make("TextButton", {
+	Name = "Open",
+	Size = UDim2.fromOffset(150, 38),
+	Position = UDim2.new(0, 15, 1, -55),
+	BackgroundColor3 = Color3.fromRGB(30, 30, 35),
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 15,
+	Font = Enum.Font.GothamBold,
+	Text = "LOCAL WEAPONS",
+}, gui)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, openButton)
+
+local window = make("Frame", {
+	Name = "Window",
+	Size = UDim2.fromOffset(430, 520),
+	Position = UDim2.new(0.5, -215, 0.5, -260),
+	BackgroundColor3 = Color3.fromRGB(22, 22, 26),
+	BorderSizePixel = 0,
+	Visible = false,
+}, gui)
+make("UICorner", { CornerRadius = UDim.new(0, 10) }, window)
+make("UIStroke", { Color = Color3.fromRGB(65, 65, 72) }, window)
+
+make("TextLabel", {
+	Size = UDim2.new(1, -50, 0, 42),
+	Position = UDim2.fromOffset(15, 5),
+	BackgroundTransparency = 1,
+	Text = "MM2 Local Weapon Inventory",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 18,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, window)
+
+local close = make("TextButton", {
+	Size = UDim2.fromOffset(35, 35),
+	Position = UDim2.new(1, -42, 0, 7),
+	BackgroundTransparency = 1,
+	Text = "×",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 25,
+	Font = Enum.Font.GothamBold,
+}, window)
+
+local search = make("TextBox", {
+	Size = UDim2.new(1, -30, 0, 38),
+	Position = UDim2.fromOffset(15, 50),
+	BackgroundColor3 = Color3.fromRGB(35, 35, 41),
+	BorderSizePixel = 0,
+	PlaceholderText = "Search weapon...",
+	PlaceholderColor3 = Color3.fromRGB(150, 150, 155),
+	Text = "",
+	TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 14,
+	Font = Enum.Font.Gotham,
+	ClearTextOnFocus = false,
+}, window)
+make("UICorner", { CornerRadius = UDim.new(0, 7) }, search)
+
+local list = make("ScrollingFrame", {
+	Name = "WeaponList",
+	Size = UDim2.new(1, -30, 1, -105),
+	Position = UDim2.fromOffset(15, 95),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 5,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, window)
+make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+
+local function makeWeaponRow(itemId, order)
+	local row = make("Frame", {
+		Name = itemId,
+		Size = UDim2.new(1, -5, 0, 58),
+		BackgroundColor3 = Color3.fromRGB(32, 32, 38),
+		BorderSizePixel = 0,
+		LayoutOrder = order,
+	}, list)
+	make("UICorner", { CornerRadius = UDim.new(0, 7) }, row)
+
+	make("ImageLabel", {
+		Size = UDim2.fromOffset(48, 48),
+		Position = UDim2.fromOffset(5, 5),
+		BackgroundTransparency = 1,
+		Image = getWeaponImage(itemId),
+	}, row)
+
+	make("TextLabel", {
+		Size = UDim2.new(1, -190, 1, 0),
+		Position = UDim2.fromOffset(62, 0),
+		BackgroundTransparency = 1,
+		Text = getWeaponDisplayName(itemId),
+		TextColor3 = Color3.fromRGB(240, 240, 240),
+		TextSize = 14,
+		Font = Enum.Font.GothamMedium,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, row)
+
+	local give = make("TextButton", {
+		Size = UDim2.fromOffset(58, 32),
+		Position = UDim2.new(1, -125, 0.5, -16),
+		BackgroundColor3 = Color3.fromRGB(55, 55, 63),
+		Text = ownedLocal[itemId] and "OWNED" or "GIVE",
+		TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 11,
+		Font = Enum.Font.GothamBold,
+	}, row)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, give)
+
+	give.Activated:Connect(function()
+		if addLocalItem(itemId) then
+			give.Text = "OWNED"
+		end
+	end)
+
+	return row
+end
+
+local itemIds = {}
+for itemId, info in pairs(Weapons) do
+	if type(itemId) == "string" and type(info) == "table" then
+		table.insert(itemIds, itemId)
+	end
+end
+table.sort(itemIds, function(a, b)
+	return string.lower(getWeaponDisplayName(a)) < string.lower(getWeaponDisplayName(b))
+end)
+
+local rows = {}
+for order, itemId in ipairs(itemIds) do
+	rows[itemId] = makeWeaponRow(itemId, order)
+end
+
+search:GetPropertyChangedSignal("Text"):Connect(function()
+	local query = string.lower(search.Text or "")
+	for itemId, row in pairs(rows) do
+		row.Visible = query == ""
+			or string.find(string.lower(getWeaponDisplayName(itemId)), query, 1, true) ~= nil
+			or string.find(string.lower(itemId), query, 1, true) ~= nil
+	end
+end)
+
+openButton.Activated:Connect(function()
+	window.Visible = not window.Visible
+end)
+close.Activated:Connect(function()
+	window.Visible = false
+end)
+
+print("[MM2Local] Loaded. Weapons available:", #itemIds)
+
 --// This script uses the data that already exists in the place:
 --//   ReplicatedStorage.Database.Sync.Weapons
 --//   ReplicatedStorage.Modules.ProfileData
