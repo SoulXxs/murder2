@@ -13,7 +13,645 @@
 --//   ReplicatedStorage.Database.Sync.Weapons
 --//   ReplicatedStorage.Modules.ProfileData
 --//   ReplicatedStorage.Remotes.Inventory.InventoryDataChanged
---//
+--//-- MM2 Local Weapon Inventory
+-- Put in StarterPlayer > StarterPlayerScripts
+--
+-- GIVE = adds the selected item to the LOCAL inventory only.
+-- There is NO custom EQUIP button.
+-- The normal MM2 Inventory is used for Equip.
+--
+-- Important limitation of a LocalScript:
+-- The supplied place stores the real 3D weapon templates and weapon scripts in
+-- ServerStorage. A LocalScript cannot clone/read ServerStorage. Therefore this
+-- script watches the game's local Equipped data and creates a client-side Tool
+-- when normal Inventory -> Equip changes Knife/Gun. If a client-visible Tool
+-- template exists, it is used. Otherwise a visible local placeholder model is
+-- created so the weapon is actually visible in the hand.
+--
+-- The server-side MM2 weapon/damage system still requires the game's normal
+-- server replication. With the requested LOCAL-ONLY setup, this script cannot
+-- make a server-authoritative hit/damage happen without using the game's
+-- server-side weapon/remotes.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPack = game:GetService("StarterPack")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local Database = ReplicatedStorage:WaitForChild("Database")
+local Sync = require(Database:WaitForChild("Sync"))
+local Weapons = Sync.Weapons or Sync.Item or {}
+
+local ProfileData
+pcall(function()
+    ProfileData = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("ProfileData"))
+end)
+
+local InventoryRemotes = ReplicatedStorage:FindFirstChild("Remotes")
+    and ReplicatedStorage.Remotes:FindFirstChild("Inventory")
+local InventoryDataChanged = InventoryRemotes and InventoryRemotes:FindFirstChild("InventoryDataChanged")
+
+local ownedLocal = {}
+local currentTool
+local currentVisual
+local currentWeaponId
+local lastEquippedKnife
+local lastEquippedGun
+local suppressEquipUpdate = false
+
+local function info(id)
+    return Weapons[id]
+end
+
+local function displayName(id)
+    local v = info(id)
+    return v and (v.ItemName or v.Name or v.DisplayName or id) or tostring(id)
+end
+
+local function imageId(id)
+    local v = info(id)
+    local image = v and (v.Image or v.Icon)
+    if not image then return "" end
+    local s = tostring(image)
+    if s:match("^%d+$") then return "rbxassetid://" .. s end
+    return s
+end
+
+local function character()
+    return player.Character
+end
+
+local function humanoid()
+    local c = character()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function rightHand()
+    local c = character()
+    if not c then return nil end
+    return c:FindFirstChild("RightHand")
+        or c:FindFirstChild("Right Arm")
+        or c:FindFirstChild("RightLowerArm")
+        or c:FindFirstChild("RightUpperArm")
+end
+
+local function isGun(id)
+    local s = string.lower(tostring(id))
+    local v = info(id)
+    if v and v.ItemType == "Gun" then return true end
+    return s:find("gun", 1, true) ~= nil
+        or s:find("luger", 1, true) ~= nil
+        or s:find("blaster", 1, true) ~= nil
+        or s:find("pistol", 1, true) ~= nil
+        or s:find("revolver", 1, true) ~= nil
+        or s:find("laser", 1, true) ~= nil
+        or s:find("scope", 1, true) ~= nil
+end
+
+local function clearObject(obj)
+    if obj then
+        pcall(function() obj:Destroy() end)
+    end
+end
+
+local function clearEquipped()
+    clearObject(currentVisual)
+    currentVisual = nil
+
+    clearObject(currentTool)
+    currentTool = nil
+
+    local bp = player:FindFirstChildOfClass("Backpack")
+    if bp then
+        for _, x in ipairs(bp:GetChildren()) do
+            if x:IsA("Tool") and x:GetAttribute("MM2LocalWeapon") then
+                x:Destroy()
+            end
+        end
+    end
+
+    local c = character()
+    if c then
+        for _, x in ipairs(c:GetChildren()) do
+            if x:IsA("Tool") and x:GetAttribute("MM2LocalWeapon") then
+                x:Destroy()
+            end
+        end
+    end
+end
+
+local function findTool(root, id)
+    if not root then return nil end
+
+    local exact = root:FindFirstChild(id, true)
+    if exact and exact:IsA("Tool") then
+        return exact
+    end
+
+    for _, x in ipairs(root:GetDescendants()) do
+        if x:IsA("Tool") then
+            if x:GetAttribute("ItemID") == id or x:GetAttribute("OriginalItemID") == id then
+                return x
+            end
+        end
+    end
+end
+
+local function findClientTemplate(id)
+    -- Exact item first.
+    local t = findTool(ReplicatedStorage, id)
+    if t then return t end
+    t = findTool(StarterPack, id)
+    if t then return t end
+
+    -- Then a real client-visible Gun/Knife base.
+    local wanted = isGun(id) and {"Gun", "DefaultGun"} or {"Knife", "DefaultKnife"}
+    for _, root in ipairs({ReplicatedStorage, StarterPack}) do
+        for _, n in ipairs(wanted) do
+            local x = root:FindFirstChild(n, true)
+            if x and x:IsA("Tool") then return x end
+        end
+    end
+
+    -- Finally, use a currently visible weapon Tool as a base if the game has one.
+    local c = character()
+    local bp = player:FindFirstChildOfClass("Backpack")
+    for _, root in ipairs({c, bp}) do
+        if root then
+            for _, x in ipairs(root:GetChildren()) do
+                if x:IsA("Tool") and not x:GetAttribute("MM2LocalWeapon") then
+                    local n = string.lower(x.Name)
+                    if (isGun(id) and n:find("gun",1,true)) or ((not isGun(id)) and n:find("knife",1,true)) then
+                        return x
+                    end
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function setPartsVisible(root)
+    for _, x in ipairs(root:GetDescendants()) do
+        if x:IsA("BasePart") then
+            x.Anchored = false
+            x.CanCollide = false
+            x.CanTouch = false
+            x.CanQuery = false
+            x.Massless = true
+            -- Never force transparency to 0: some weapon models intentionally
+            -- contain invisible helper parts.
+        end
+    end
+end
+
+local function weldModel(model, target, offset)
+    if not model or not target then return false end
+
+    local primary = model:FindFirstChild("Handle", true)
+    if not primary or not primary:IsA("BasePart") then
+        primary = model:FindFirstChildWhichIsA("BasePart", true)
+    end
+    if not primary then return false end
+
+    setPartsVisible(model)
+    model.PrimaryPart = primary
+    model:PivotTo(target.CFrame * offset)
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "MM2LocalHandWeld"
+    weld.Part0 = primary
+    weld.Part1 = target
+    weld.Parent = primary
+    return true
+end
+
+local function cloneVisibleParts(source)
+    local model = Instance.new("Model")
+    model.Name = "MM2LocalVisual_" .. tostring(currentWeaponId)
+    model:SetAttribute("MM2LocalWeapon", true)
+    model:SetAttribute("ItemID", currentWeaponId)
+    model:SetAttribute("OriginalItemID", currentWeaponId)
+
+    local copied = 0
+    for _, x in ipairs(source:GetChildren()) do
+        if x:IsA("BasePart") or x:IsA("Model") or x:IsA("Folder") then
+            local c = x:Clone()
+            c.Parent = model
+            copied += 1
+        end
+    end
+
+    return model, copied
+end
+
+local function createSimpleGunModel(id)
+    -- Visible fallback if the place exposes no Gun Tool to the client.
+    -- This is intentionally a simple 3D local model, not the original
+    -- ServerStorage model.
+    local m = Instance.new("Model")
+    m.Name = "MM2LocalGunVisual_" .. id
+
+    local body = Instance.new("Part")
+    body.Name = "Body"
+    body.Size = Vector3.new(0.42, 0.18, 1.35)
+    body.Material = Enum.Material.SmoothPlastic
+    body.Parent = m
+
+    local grip = Instance.new("Part")
+    grip.Name = "Grip"
+    grip.Size = Vector3.new(0.28, 0.65, 0.38)
+    grip.CFrame = CFrame.new(0, -0.34, 0.28) * CFrame.Angles(math.rad(-15), 0, 0)
+    grip.Material = Enum.Material.SmoothPlastic
+    grip.Parent = m
+
+    local barrel = Instance.new("Part")
+    barrel.Name = "Barrel"
+    barrel.Size = Vector3.new(0.12, 0.12, 0.65)
+    barrel.CFrame = CFrame.new(0, 0, -0.95)
+    barrel.Material = Enum.Material.Metal
+    barrel.Parent = m
+
+    return m
+end
+
+local function createSimpleKnifeModel(id)
+    local m = Instance.new("Model")
+    m.Name = "MM2LocalKnifeVisual_" .. id
+
+    local handle = Instance.new("Part")
+    handle.Name = "Handle"
+    handle.Size = Vector3.new(0.16, 0.75, 0.16)
+    handle.Material = Enum.Material.SmoothPlastic
+    handle.Parent = m
+
+    local blade = Instance.new("Part")
+    blade.Name = "Blade"
+    blade.Size = Vector3.new(0.12, 1.35, 0.32)
+    blade.CFrame = CFrame.new(0, 1.0, 0)
+    blade.Material = Enum.Material.Metal
+    blade.Parent = m
+
+    return m
+end
+
+local function attachVisual(id, sourceTool)
+    local hand = rightHand()
+    local c = character()
+    if not hand or not c then return false end
+
+    clearObject(currentVisual)
+    currentVisual = nil
+
+    local visual
+    local count = 0
+
+    if sourceTool then
+        visual, count = cloneVisibleParts(sourceTool)
+    end
+
+    if not visual or count == 0 then
+        if isGun(id) then
+            visual = createSimpleGunModel(id)
+        else
+            visual = createSimpleKnifeModel(id)
+        end
+    end
+
+    -- Roblox Tool grip orientation is different between R6/R15. This offset
+    -- places the local visual in the hand rather than behind the character.
+    local offset
+    if isGun(id) then
+        offset = CFrame.new(0, -0.18, -0.42) * CFrame.Angles(math.rad(-90), 0, math.rad(90))
+    else
+        offset = CFrame.new(0, -0.10, -0.30) * CFrame.Angles(math.rad(-90), 0, 0)
+    end
+
+    if not weldModel(visual, hand, offset) then
+        visual:Destroy()
+        return false
+    end
+
+    visual.Parent = c
+    currentVisual = visual
+    return true
+end
+
+local function makeLocalTool(id, template)
+    local tool
+    if template then
+        tool = template:Clone()
+    else
+        tool = Instance.new("Tool")
+        tool.Name = isGun(id) and "Gun" or "Knife"
+        tool.RequiresHandle = true
+        tool.CanBeDropped = false
+
+        local handle = Instance.new("Part")
+        handle.Name = "Handle"
+        handle.Size = Vector3.new(0.2, 1, 0.2)
+        handle.Transparency = 1
+        handle.CanCollide = false
+        handle.CanTouch = false
+        handle.CanQuery = false
+        handle.Massless = true
+        handle.Parent = tool
+    end
+
+    tool:SetAttribute("MM2LocalWeapon", true)
+    tool:SetAttribute("ItemID", id)
+    tool:SetAttribute("OriginalItemID", id)
+    tool.Name = isGun(id) and "Gun" or "Knife"
+    tool.CanBeDropped = false
+
+    local image = imageId(id)
+    if image ~= "" then
+        pcall(function() tool.TextureId = image end)
+    end
+
+    return tool
+end
+
+local function equipLocal(id)
+    if not id or not Weapons[id] then return false end
+    if suppressEquipUpdate then return false end
+
+    currentWeaponId = id
+    clearEquipped()
+
+    local template = findClientTemplate(id)
+    local tool = makeLocalTool(id, template)
+    local bp = player:WaitForChild("Backpack")
+    tool.Parent = bp
+    currentTool = tool
+
+    local h = humanoid()
+    if h then
+        pcall(function() h:EquipTool(tool) end)
+    end
+
+    -- Attach the visible copy after EquipTool, because Roblox may move the Tool
+    -- from Backpack to Character during the same frame.
+    task.defer(function()
+        if currentTool == tool and tool.Parent then
+            attachVisual(id, template or tool)
+        end
+    end)
+
+    return true
+end
+
+-- ============================================================
+-- Detect normal MM2 Inventory -> Equip.
+-- We use BOTH EquipService.EquippedChanged and ProfileData polling. The polling
+-- is the important fallback: it works even when EquipService is a custom Signal
+-- or its module path changes.
+-- ============================================================
+local function hookEquipService()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    if not modules then return end
+
+    local module = modules:FindFirstChild("EquipService", true)
+    if not module or not module:IsA("ModuleScript") then return end
+
+    local ok, service = pcall(require, module)
+    if not ok or not service then
+        warn("[MM2Local] EquipService require failed:", service)
+        return
+    end
+
+    local signal = service.EquippedChanged
+    if not signal then return end
+
+    local function changed(itemType, id)
+        if (itemType == "Knife" or itemType == "Gun") and type(id) == "string" then
+            task.defer(function()
+                equipLocal(id)
+            end)
+        end
+    end
+
+    if typeof(signal) == "Instance" and signal:IsA("BindableEvent") then
+        signal.Event:Connect(changed)
+        print("[MM2Local] EquipService BindableEvent connected")
+    elseif type(signal.Connect) == "function" then
+        signal:Connect(changed)
+        print("[MM2Local] EquipService signal connected")
+    end
+end
+
+hookEquipService()
+
+-- ProfileData is changed by the game's EquipService BEFORE it calls the server
+-- remote. So this catches normal Inventory Equip without sending our own remote.
+task.spawn(function()
+    local lastK, lastG
+    while player.Parent do
+        task.wait(0.15)
+        if ProfileData and ProfileData.Weapons and ProfileData.Weapons.Equipped then
+            local e = ProfileData.Weapons.Equipped
+            local k, g = e.Knife, e.Gun
+
+            if type(k) == "string" and k ~= lastK then
+                lastK = k
+                lastEquippedKnife = k
+                if ownedLocal[k] or (ProfileData.Weapons.Owned and ProfileData.Weapons.Owned[k]) then
+                    equipLocal(k)
+                end
+            end
+
+            if type(g) == "string" and g ~= lastG then
+                lastG = g
+                lastEquippedGun = g
+                if ownedLocal[g] or (ProfileData.Weapons.Owned and ProfileData.Weapons.Owned[g]) then
+                    equipLocal(g)
+                end
+            end
+        end
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    local id = currentWeaponId or lastEquippedKnife or lastEquippedGun
+    if id and Weapons[id] and (ownedLocal[id] or (ProfileData and ProfileData.Weapons and ProfileData.Weapons.Owned and ProfileData.Weapons.Owned[id])) then
+        equipLocal(id)
+    end
+end)
+
+-- ============================================================
+-- Local inventory grant
+-- ============================================================
+local function give(id)
+    if not Weapons[id] then return false end
+    ownedLocal[id] = true
+
+    if ProfileData then
+        ProfileData.Weapons = ProfileData.Weapons or {}
+        ProfileData.Weapons.Owned = ProfileData.Weapons.Owned or {}
+        ProfileData.Weapons.Owned[id] = 1
+    end
+
+    if InventoryDataChanged and InventoryDataChanged:IsA("BindableEvent") then
+        InventoryDataChanged:Fire("Weapons", id, 1)
+    end
+    return true
+end
+
+-- ============================================================
+-- GUI: only GIVE. No EQUIP button.
+-- ============================================================
+local old = playerGui:FindFirstChild("MM2LocalWeaponController")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "MM2LocalWeaponController"
+gui.ResetOnSpawn = false
+gui.Parent = playerGui
+
+local open = Instance.new("TextButton")
+open.Size = UDim2.fromOffset(150, 38)
+open.Position = UDim2.new(0, 15, 1, -55)
+open.BackgroundColor3 = Color3.fromRGB(30,30,35)
+open.TextColor3 = Color3.new(1,1,1)
+open.Text = "LOCAL WEAPONS"
+open.Font = Enum.Font.GothamBold
+open.TextSize = 14
+open.Parent = gui
+Instance.new("UICorner", open).CornerRadius = UDim.new(0,8)
+
+local win = Instance.new("Frame")
+win.Size = UDim2.fromOffset(430,520)
+win.Position = UDim2.new(.5,-215,.5,-260)
+win.BackgroundColor3 = Color3.fromRGB(22,22,26)
+win.Visible = false
+win.Parent = gui
+Instance.new("UICorner", win).CornerRadius = UDim.new(0,10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1,-50,0,42)
+title.Position = UDim2.fromOffset(15,5)
+title.BackgroundTransparency = 1
+title.Text = "MM2 Local Weapon Inventory"
+title.TextColor3 = Color3.new(1,1,1)
+title.TextSize = 18
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = win
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(35,35)
+close.Position = UDim2.new(1,-42,0,7)
+close.BackgroundTransparency = 1
+close.Text = "×"
+close.TextColor3 = Color3.new(1,1,1)
+close.TextSize = 25
+close.Font = Enum.Font.GothamBold
+close.Parent = win
+
+local search = Instance.new("TextBox")
+search.Size = UDim2.new(1,-30,0,38)
+search.Position = UDim2.fromOffset(15,50)
+search.BackgroundColor3 = Color3.fromRGB(35,35,41)
+search.BorderSizePixel = 0
+search.PlaceholderText = "Search weapon..."
+search.TextColor3 = Color3.new(1,1,1)
+search.PlaceholderColor3 = Color3.fromRGB(150,150,155)
+search.ClearTextOnFocus = false
+search.Font = Enum.Font.Gotham
+search.TextSize = 14
+search.Parent = win
+Instance.new("UICorner", search).CornerRadius = UDim.new(0,7)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1,-30,1,-105)
+list.Position = UDim2.fromOffset(15,95)
+list.BackgroundTransparency = 1
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 5
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = win
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0,5)
+layout.Parent = list
+
+local ids = {}
+for id,v in pairs(Weapons) do
+    if type(id) == "string" and type(v) == "table" then
+        table.insert(ids,id)
+    end
+end
+
+table.sort(ids,function(a,b)
+    return string.lower(displayName(a)) < string.lower(displayName(b))
+end)
+
+local rows = {}
+for order,id in ipairs(ids) do
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,-5,0,58)
+    row.BackgroundColor3 = Color3.fromRGB(32,32,38)
+    row.LayoutOrder = order
+    row.Parent = list
+    Instance.new("UICorner",row).CornerRadius = UDim.new(0,7)
+
+    local icon = Instance.new("ImageLabel")
+    icon.Size = UDim2.fromOffset(48,48)
+    icon.Position = UDim2.fromOffset(5,5)
+    icon.BackgroundTransparency = 1
+    icon.Image = imageId(id):gsub("rbxassetid://","rbxthumb://type=Asset&w=150&h=150&id=")
+    row.Parent = list
+    icon.Parent = row
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1,-190,1,0)
+    label.Position = UDim2.fromOffset(62,0)
+    label.BackgroundTransparency = 1
+    label.Text = displayName(id)
+    label.TextColor3 = Color3.fromRGB(240,240,240)
+    label.TextSize = 14
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Parent = row
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(72,32)
+    btn.Position = UDim2.new(1,-82,.5,-16)
+    btn.BackgroundColor3 = Color3.fromRGB(55,55,63)
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.TextSize = 11
+    btn.Font = Enum.Font.GothamBold
+    btn.Text = ownedLocal[id] and "OWNED" or "GIVE"
+    btn.Parent = row
+    Instance.new("UICorner",btn).CornerRadius = UDim.new(0,6)
+
+    btn.Activated:Connect(function()
+        if give(id) then btn.Text = "OWNED" end
+    end)
+
+    rows[id] = row
+end
+
+search:GetPropertyChangedSignal("Text"):Connect(function()
+    local q = string.lower(search.Text or "")
+    for id,row in pairs(rows) do
+        local n = string.lower(displayName(id))
+        local key = string.lower(id)
+        row.Visible = q == "" or n:find(q,1,true) ~= nil or key:find(q,1,true) ~= nil
+    end
+end)
+
+open.Activated:Connect(function() win.Visible = not win.Visible end)
+close.Activated:Connect(function() win.Visible = false end)
+
+print("[MM2Local] Loaded. Items:", #ids)
+
 --// No permission check and no RemoteEvent request are used for the grant.
 --// Clicking GIVE adds the item to the LOCAL player's inventory only.
 --// There is intentionally NO EQUIP button here.
