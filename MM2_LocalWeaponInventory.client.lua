@@ -1,4 +1,4 @@
---// MM2 Local Weapon Inventory / Equip Controller
+--// MM2 Local Weapon Inventory / Grant Controller
 --// ONE LocalScript
 --// Put in: StarterPlayer > StarterPlayerScripts
 --//
@@ -7,9 +7,10 @@
 --//   ReplicatedStorage.Modules.ProfileData
 --//   ReplicatedStorage.Remotes.Inventory.InventoryDataChanged
 --//
---// No permission check and no RemoteEvent request are used.
---// Clicking an item adds it to the LOCAL player's inventory only.
---// The normal MM2 inventory UI can then display it through InventoryDataChanged.
+--// No permission check and no RemoteEvent request are used for the grant.
+--// Clicking GIVE adds the item to the LOCAL player's inventory only.
+--// There is intentionally NO EQUIP button here.
+--// After granting, use the game's normal Inventory UI to equip the item.
 --//
 --// IMPORTANT:
 --// The supplied place stores the real weapon Tool templates under ServerStorage.
@@ -79,10 +80,39 @@ local function getWeaponImage(itemId)
 	return tostring(image)
 end
 
+local currentVisual = nil
+
+local function getCharacter()
+	return LocalPlayer.Character
+end
+
+local function findRightHand(character)
+	return character:FindFirstChild("RightHand")
+		or character:FindFirstChild("Right Arm")
+		or character:FindFirstChild("RightUpperArm")
+end
+
+local function findLeftShoulder(character)
+	return character:FindFirstChild("LeftUpperArm")
+		or character:FindFirstChild("Left Arm")
+		or character:FindFirstChild("LeftHand")
+end
+
+local function destroyLocalVisual()
+	if currentVisual and currentVisual.Parent then
+		currentVisual:Destroy()
+	end
+	currentVisual = nil
+end
+
 local function removeLocalWeapon()
 	if currentTool then
 		currentTool:Destroy()
 		currentTool = nil
+	end
+
+	if currentVisual then
+		destroyLocalVisual()
 	end
 
 	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -105,14 +135,8 @@ local function removeLocalWeapon()
 end
 
 local function findClientToolTemplate(itemId)
-	-- The real place has its weapon Tools in ServerStorage.Database.Item.
-	-- That container is NOT accessible to a LocalScript.
-	-- Search only client-visible containers.
-
-	local containers = {
-		ReplicatedStorage,
-		StarterPack,
-	}
+	-- Exact item model, if the place exposes it to the client.
+	local containers = { ReplicatedStorage, StarterPack }
 
 	for _, root in ipairs(containers) do
 		local exact = root:FindFirstChild(itemId, true)
@@ -121,7 +145,7 @@ local function findClientToolTemplate(itemId)
 		end
 	end
 
-	-- Some projects keep a generic Tool whose Attribute identifies the item.
+	-- Tool identified by ItemID / OriginalItemID.
 	for _, root in ipairs(containers) do
 		for _, object in ipairs(root:GetDescendants()) do
 			if object:IsA("Tool") then
@@ -134,6 +158,143 @@ local function findClientToolTemplate(itemId)
 	end
 
 	return nil
+end
+
+local function findGenericVisibleTool(itemId)
+	-- If the exact item is server-only, use a client-visible Knife/Gun model
+	-- as a 3D base. The item's own texture/icon is then applied to it.
+	local wanted = string.lower(itemId)
+	local isGun = string.find(wanted, "gun", 1, true) ~= nil
+		or string.find(wanted, "luger", 1, true) ~= nil
+		or string.find(wanted, "blaster", 1, true) ~= nil
+		or string.find(wanted, "pistol", 1, true) ~= nil
+		or string.find(wanted, "revolver", 1, true) ~= nil
+
+	local names = isGun and { "Gun", "DefaultGun" } or { "Knife", "DefaultKnife" }
+	local roots = { ReplicatedStorage, StarterPack }
+
+	-- Prefer a model already visible on the local character/backpack.
+	local character = LocalPlayer.Character
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	local localRoots = { character, backpack }
+	for _, root in ipairs(localRoots) do
+		if root then
+			for _, object in ipairs(root:GetChildren()) do
+				if object:IsA("Tool") then
+					for _, name in ipairs(names) do
+						if string.lower(object.Name) == string.lower(name) then
+							return object
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for _, root in ipairs(roots) do
+		for _, name in ipairs(names) do
+			local found = root:FindFirstChild(name, true)
+			if found and found:IsA("Tool") then
+				return found
+			end
+		end
+	end
+
+	return nil
+end
+
+local function applyWeaponTexture(instance, itemId)
+	local info = getWeaponInfo(itemId)
+	if not info then
+		return
+	end
+
+	local image = info.Image or info.Icon
+	if not image then
+		return
+	end
+
+	local imageId = tostring(image)
+	if imageId:match("^%d+$") then
+		imageId = "rbxassetid://" .. imageId
+	end
+
+	for _, object in ipairs(instance:GetDescendants()) do
+		if object:IsA("Decal") or object:IsA("Texture") then
+			object.Texture = imageId
+		elseif object:IsA("MeshPart") then
+			-- Keep the actual mesh/material of the client-visible base.
+			-- TextureId is read-only on some MeshPart setups, so don't force it.
+		end
+	end
+
+	local tool = instance:IsA("Tool") and instance or instance:FindFirstChildWhichIsA("Tool", true)
+	if tool then
+		pcall(function()
+			tool.TextureId = imageId
+		end)
+	end
+end
+
+local function weldModelToPart(model, targetPart, offset)
+	if not model or not targetPart then
+		return false
+	end
+
+	local primary = model.PrimaryPart
+	if not primary then
+		primary = model:FindFirstChild("Handle", true)
+	end
+	if not primary or not primary:IsA("BasePart") then
+		primary = model:FindFirstChildWhichIsA("BasePart", true)
+	end
+	if not primary then
+		return false
+	end
+
+	for _, object in ipairs(model:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = false
+			object.CanCollide = false
+			object.CanTouch = false
+			object.CanQuery = false
+			object.Massless = true
+		end
+	end
+
+	model.PrimaryPart = primary
+	model:PivotTo(targetPart.CFrame * offset)
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Name = "MM2LocalVisualWeld"
+	weld.Part0 = primary
+	weld.Part1 = targetPart
+	weld.Parent = primary
+
+	return true
+end
+
+local function makeFallbackVisual(itemId)
+	local baseTool = findGenericVisibleTool(itemId)
+	if not baseTool then
+		return nil
+	end
+
+	local model = Instance.new("Model")
+	model.Name = "MM2LocalVisual_" .. tostring(itemId)
+	model:SetAttribute("MM2LocalWeapon", true)
+	model:SetAttribute("ItemID", itemId)
+	model:SetAttribute("OriginalItemID", itemId)
+
+	for _, child in ipairs(baseTool:GetChildren()) do
+		if child:IsA("BasePart") or child:IsA("Model") or child:IsA("Folder") then
+			local clone = child:Clone()
+			clone.Parent = model
+		end
+	end
+
+	applyWeaponTexture(model, itemId)
+	return model
 end
 
 local function makeFallbackTool(itemId)
@@ -171,6 +332,38 @@ local function makeFallbackTool(itemId)
 	return tool
 end
 
+local function attachExactToolVisual(tool, itemId)
+	local character = getCharacter()
+	local hand = findRightHand(character)
+	if not character or not hand then
+		return false
+	end
+
+	-- Clone the Tool's visible parts into a separate Model. This lets us keep
+	-- the visual attached to the hand even if Roblox's Tool grip is changed.
+	local model = Instance.new("Model")
+	model.Name = "MM2LocalVisual_" .. tostring(itemId)
+	model:SetAttribute("MM2LocalWeapon", true)
+	model:SetAttribute("ItemID", itemId)
+	model:SetAttribute("OriginalItemID", itemId)
+
+	for _, child in ipairs(tool:GetChildren()) do
+		if child:IsA("BasePart") or child:IsA("Model") or child:IsA("Folder") then
+			local clone = child:Clone()
+			clone.Parent = model
+		end
+	end
+
+	if not weldModelToPart(model, hand, CFrame.new(0, -0.25, -0.35) * CFrame.Angles(math.rad(-90), 0, 0)) then
+		model:Destroy()
+		return false
+	end
+
+	model.Parent = character
+	currentVisual = model
+	return true
+end
+
 local function equipLocalWeapon(itemId)
 	if not Weapons[itemId] then
 		warn("[MM2Local] Unknown weapon:", itemId)
@@ -180,36 +373,73 @@ local function equipLocalWeapon(itemId)
 	removeLocalWeapon()
 
 	local template = findClientToolTemplate(itemId)
-	local tool
-
 	if template then
-		tool = template:Clone()
+		-- Keep a real Tool in the Backpack so the existing inventory/equip flow
+		-- still works, and separately force a visible hand model.
+		local tool = template:Clone()
 		tool:SetAttribute("MM2LocalWeapon", true)
 		tool:SetAttribute("ItemID", itemId)
 		tool:SetAttribute("OriginalItemID", itemId)
-	else
-		tool = makeFallbackTool(itemId)
+		tool.Name = getWeaponDisplayName(itemId)
+		tool.CanBeDropped = false
+
+		local backpack = LocalPlayer:WaitForChild("Backpack")
+		tool.Parent = backpack
+		currentTool = tool
+		currentWeaponId = itemId
+
+		local humanoid = getCharacter() and getCharacter():FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid:EquipTool(tool)
+		end
+
+		-- Explicit visual weld fixes cases where Tool grip/Handle setup doesn't
+		-- render correctly on the client.
+		if not attachExactToolVisual(tool, itemId) then
+			local visual = makeFallbackVisual(itemId)
+			local hand = getCharacter() and findRightHand(getCharacter())
+			if visual and hand then
+				if weldModelToPart(visual, hand, CFrame.new(0, -0.25, -0.35) * CFrame.Angles(math.rad(-90), 0, 0)) then
+					visual.Parent = getCharacter()
+					currentVisual = visual
+				end
+			end
+		end
+		return true
 	end
 
+	-- No exact client-visible model: use a generic client-visible 3D Tool
+	-- (Knife/Gun) as the visual base instead of an invisible Handle.
+	local visual = makeFallbackVisual(itemId)
+	local character = getCharacter()
+	local hand = character and findRightHand(character)
+
+	if visual and hand then
+		local ok = weldModelToPart(visual, hand,
+			CFrame.new(0, -0.25, -0.35) * CFrame.Angles(math.rad(-90), 0, 0))
+		if ok then
+			visual.Parent = character
+			currentVisual = visual
+			currentWeaponId = itemId
+			return true
+		end
+		visual:Destroy()
+	end
+
+	-- Last-resort Tool fallback. It will still exist in the local Backpack.
+	local tool = makeFallbackTool(itemId)
 	if not tool then
 		return false
 	end
 
-	tool.Name = getWeaponDisplayName(itemId)
-	tool.CanBeDropped = false
-
 	local backpack = LocalPlayer:WaitForChild("Backpack")
 	tool.Parent = backpack
-
 	currentTool = tool
 	currentWeaponId = itemId
 
-	local character = LocalPlayer.Character
-	if character then
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		if humanoid then
-			humanoid:EquipTool(tool)
-		end
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid:EquipTool(tool)
 	end
 
 	return true
@@ -387,35 +617,10 @@ local function makeWeaponRow(itemId, info, order)
 	giveCorner.CornerRadius = UDim.new(0, 6)
 	giveCorner.Parent = give
 
-	local equip = Instance.new("TextButton")
-	equip.Size = UDim2.fromOffset(58, 32)
-	equip.Position = UDim2.new(1, -62, 0.5, -16)
-	equip.BackgroundColor3 = Color3.fromRGB(75, 75, 84)
-	equip.Text = "EQUIP"
-	equip.TextColor3 = Color3.fromRGB(255, 255, 255)
-	equip.TextSize = 11
-	equip.Font = Enum.Font.GothamBold
-	equip.Parent = row
-
-	local equipCorner = Instance.new("UICorner")
-	equipCorner.CornerRadius = UDim.new(0, 6)
-	equipCorner.Parent = equip
-
 	give.Activated:Connect(function()
 		if addLocalItem(itemId) then
 			give.Text = "OWNED"
 		end
-	end)
-
-	equip.Activated:Connect(function()
-		if not ownedLocal[itemId] then
-			if not addLocalItem(itemId) then
-				return
-			end
-			give.Text = "OWNED"
-		end
-
-		equipLocalWeapon(itemId)
 	end)
 
 	return row
@@ -456,20 +661,6 @@ end)
 
 close.Activated:Connect(function()
 	window.Visible = false
-end)
-
--- ============================================================
--- Respawn
--- ============================================================
--- The local Tool disappears with the old Character. Re-equip the last
--- selected local item after respawn.
-
-LocalPlayer.CharacterAdded:Connect(function()
-	task.wait(0.25)
-
-	if currentWeaponId and ownedLocal[currentWeaponId] then
-		equipLocalWeapon(currentWeaponId)
-	end
 end)
 
 print("[MM2Local] Loaded. Weapons available:", #itemIds)
